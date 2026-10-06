@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+hunter_report.txt
+hunter_report.json
+hunter_report.sarif
+*.log
