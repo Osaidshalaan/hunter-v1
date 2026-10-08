@@ -41,6 +41,24 @@ from hunter_v2_ext import (
 )
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+
+def _make_soup(content_type: str, body: bytes):
+    """Choose parser based on Content-Type."""
+    from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+    import warnings
+    ct = (content_type or "").lower()
+    if "xml" in ct and "html" not in ct:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+            try:
+                return BeautifulSoup(body.decode("utf-8", errors="ignore"), "html.parser")
+            except Exception:
+                return None
+    try:
+        return BeautifulSoup(body.decode("utf-8", errors="ignore"), "html.parser")
+    except Exception:
+        return None
 NEUTRAL = "WEBPT9F3APROBE"
 
 
@@ -196,7 +214,7 @@ def extract_js_paths(text):
     return sorted(paths)
 
 
-async def crawl(c, base, depth):
+async def crawl(c, base, depth, max_pages: int = 300):
     seen, queue, out = set(), [base], []
     host = urlparse(base).netloc
 
@@ -214,7 +232,7 @@ async def crawl(c, base, depth):
     except Exception:
         pass
 
-    while queue and len(out) < 500:
+    while queue and len(out) < max_pages:
         url = queue.pop(0)
         if url in seen:
             continue
@@ -228,9 +246,10 @@ async def crawl(c, base, depth):
         out.append(url)
         if depth <= 0:
             continue
-        try:
-            soup = BeautifulSoup(b.decode("utf-8", errors="ignore"), "html.parser")
-        except Exception:
+        if len(out) % 25 == 0:
+            print(f"    crawled {len(out)} pages (queue {len(queue)})")
+        soup = _make_soup(h.get("content-type", ""), b)
+        if soup is None:
             continue
         for tag in soup.find_all(["a", "form", "script", "link", "iframe"]):
             attr = tag.get("href") or tag.get("action") or tag.get("src")
@@ -268,9 +287,8 @@ async def crawl(c, base, depth):
 async def extract_forms(c, url):
     _, _, body, _ = await c.req("GET", url)
     out = []
-    try:
-        soup = BeautifulSoup(body.decode("utf-8", errors="ignore"), "html.parser")
-    except Exception:
+    soup = _make_soup("", body)
+    if soup is None:
         return out
     for f in soup.find_all("form"):
         action = urljoin(url, f.get("action") or url)
@@ -501,14 +519,51 @@ class Det:
         return None
 
     @staticmethod
-    async def redirect(c, url, method, param, other):
+    async def redirect(c, url, method, param, other, baseline_location=""):
+        import urllib.parse as _up
         for pl in OPEN_REDIRECT_PAYLOADS:
             p = dict(other); p[param] = pl
             s, h, b, _ = await c.req(method, url, params=p, allow_redirects=False)
             loc = h.get("location", "")
-            if REDIRECT_MARKER in loc:
-                return Hit("open_redirect", url, param, method, pl,
-                           f"Location: {loc}", "confirmed")
+            if not loc:
+                continue
+
+            # absolute-ize the Location
+            abs_loc = _up.urljoin(url, loc)
+            loc_p = _up.urlparse(abs_loc)
+            req_p = _up.urlparse(url)
+
+            # Redirect stays on same host? -> not open redirect
+            if loc_p.netloc == req_p.netloc:
+                continue
+
+            # Apex <-> www canonicalization? -> not open redirect
+            def strip_www(x):
+                return x[4:] if x.startswith("www.") else x
+            if strip_www(loc_p.netloc) == strip_www(req_p.netloc):
+                continue
+
+            # Location is only carrying the value as a query param? -> not redirect
+            loc_qs = _up.parse_qs(loc_p.query)
+            if param in loc_qs and loc_qs[param] == [pl]:
+                continue
+
+            # Final: is the netloc itself the payload host?
+            payload_host = _up.urlparse(
+                pl if "://" in pl else "//" + pl
+            ).netloc or pl
+            if loc_p.netloc != payload_host:
+                continue
+
+            # Baseline check: if baseline_location == abs_loc with only the
+            # query value swapped, this is passthrough reflection.
+            if baseline_location and baseline_location.replace(
+                    _up.quote(pl, safe=""), "X") == abs_loc.replace(
+                    _up.quote(pl, safe=""), "X"):
+                continue
+
+            return Hit("open_redirect", url, param, method, pl,
+                       f"Location: {abs_loc} (netloc={loc_p.netloc})", "confirmed")
         return None
 
     @staticmethod
@@ -516,15 +571,32 @@ class Det:
         for pl in CRLF_PAYLOADS:
             p = dict(other); p[param] = pl
             s, h, b, _ = await c.req(method, url, params=p, allow_redirects=False)
+
+            # A real CRLF injection means a NEW header name appeared in the
+            # response that was not in the baseline and was not sent by the
+            # client. Just having the payload string somewhere in a header
+            # value is reflection, not injection.
+
+            # Check 1: custom header name we never sent -> injected
             if CRLF_HEADER_NAME in h:
                 return Hit("crlf", url, param, method, pl,
-                           f"{CRLF_HEADER_NAME}: {h[CRLF_HEADER_NAME]}", "confirmed")
+                           f"header name injected: {CRLF_HEADER_NAME}", "confirmed")
+
+            # Check 2: Set-Cookie we never set
             if "webpt=crlf" in h.get("set-cookie", ""):
                 return Hit("crlf", url, param, method, pl,
-                           f"Set-Cookie: {h['set-cookie']}", "confirmed")
-            if "evil.com" in h.get("location", ""):
-                return Hit("crlf", url, param, method, pl,
-                           f"Location: {h['location']}", "confirmed")
+                           f"cookie injected via CRLF", "confirmed")
+
+            # Check 3: Location header with a raw CR/LF that split into a
+            # second header. This is checked at the raw-headers level.
+            raw = h.get("x-raw-headers", "")
+            if "\r\n" in raw and "location" in raw.lower():
+                # Additional sanity: a second header name we sent must appear
+                # as its own line, not as part of the Location value.
+                for line in raw.split("\r\n"):
+                    if line.lower().startswith(CRLF_HEADER_NAME + ":"):
+                        return Hit("crlf", url, param, method, pl,
+                                   f"CRLF split detected in raw headers", "confirmed")
         return None
 
     @staticmethod
@@ -699,6 +771,18 @@ async def scan_param(c, url, method, param, fields, enabled, oob):
     if s0 == 0:
         return hits
 
+    # Baseline location — send a neutral value to see what a normal
+    # redirect looks like for this endpoint. Any subsequent redirect must
+    # NOT match this pattern with only the value swapped.
+    baseline_location = ""
+    try:
+        import urllib.parse as _up
+        _, bh, _, _ = await c.req(method, url, params={**other, param: NEUTRAL},
+                                  allow_redirects=False)
+        baseline_location = _up.urljoin(url, bh.get("location", ""))
+    except Exception:
+        pass
+
     jobs = []
     if "xss" in enabled:
         jobs.append(Det.xss(c, url, method, param, b0, other))
@@ -719,7 +803,8 @@ async def scan_param(c, url, method, param, fields, enabled, oob):
     if "ssti" in enabled:
         jobs.append(Det.ssti(c, url, method, param, b0, other))
     if "redirect" in enabled:
-        jobs.append(Det.redirect(c, url, method, param, other))
+        jobs.append(Det.redirect(c, url, method, param, other,
+                                 baseline_location=baseline_location))
     if "crlf" in enabled:
         jobs.append(Det.crlf(c, url, method, param, other))
     if "ssrf" in enabled:
@@ -763,7 +848,7 @@ async def run(target, args):
     async with Client(concurrency=args.c, cookies=args.cookies,
                       headers=headers, proxy=args.proxy) as c:
         print(f"[*] Crawling {target} (depth={args.depth})")
-        pages = await crawl(c, target, args.depth)
+        pages = await crawl(c, target, args.depth, max_pages=args.max_pages)
         rep.endpoints = pages
         print(f"[*] {len(pages)} pages")
 
@@ -813,11 +898,20 @@ async def run(target, args):
             print(f"[*] {len(rep.discovered)} interesting paths")
 
         targets = []
-        for p in pages:
+        # Parallel form extraction, cap at 6 concurrent to avoid hammering
+        form_sem = asyncio.Semaphore(6)
+        async def extract_one(page_url):
+            async with form_sem:
+                try:
+                    return await extract_forms(c, page_url)
+                except Exception:
+                    return []
+        form_results = await asyncio.gather(*(extract_one(p) for p in pages))
+        for p, forms in zip(pages, form_results):
             qs = dict(parse_qsl(urlparse(p).query))
             if qs:
                 targets.append(("GET", p, qs))
-            for action, method, fields in await extract_forms(c, p):
+            for action, method, fields in forms:
                 targets.append((method, action, fields))
 
         seen = set()
@@ -829,6 +923,9 @@ async def run(target, args):
             seen.add(sig)
             uniq.append((m, u, f))
 
+        if args.max_params and len(uniq) > args.max_params:
+            uniq = uniq[:args.max_params]
+            print(f"[*] capped param-sets to {args.max_params}")
         rep.params = sorted({k for _, _, f in uniq for k in f.keys()})
         print(f"[*] {len(uniq)} param-sets / {len(rep.params)} params")
 
@@ -840,6 +937,11 @@ async def run(target, args):
                 for h in hits:
                     rep.hits.append(h)
                     print(f"[+] {h.family:22} {url} [{param}] -> {h.evidence[:80]}")
+                    # write incremental
+                    try:
+                        Path(args.j).write_text(json.dumps(asdict(rep), indent=2, default=str))
+                    except Exception:
+                        pass
 
         # ---- header injection pass
         if "header_inject" in enabled:
@@ -1041,6 +1143,10 @@ def main():
     ap.add_argument("--oob-port", type=int, default=0)
     ap.add_argument("--no-content", action="store_true",
                     help="skip content discovery")
+    ap.add_argument("--max-pages", type=int, default=300,
+                    help="max pages to crawl (default 300)")
+    ap.add_argument("--max-params", type=int, default=0,
+                    help="cap total param-sets (0 = unlimited)")
     ap.add_argument("--no-subs", action="store_true",
                     help="skip subdomain enumeration")
     ap.add_argument("--no-crt", action="store_true",
